@@ -1,0 +1,198 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  # 1. Etapa de Linter
+  lint:
+    name: Linter Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: "npm"
+          cache-dependency-path: |
+            backend/package-lock.json
+            frontend/package-lock.json
+
+      - name: Lint Backend
+        run: |
+          cd backend
+          npm ci
+          npm run lint
+
+      - name: Lint Frontend
+        run: |
+          cd frontend
+          npm ci
+          npm run lint
+
+  # 2. Etapa de Pruebas Unitarias
+  test:
+    name: Unit Testing
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: "npm"
+          cache-dependency-path: |
+            backend/package-lock.json
+            frontend/package-lock.json
+
+      - name: Test Backend
+        run: |
+          cd backend
+          npm ci
+          npm run test
+
+      - name: Test Frontend
+        run: |
+          cd frontend
+          npm ci
+          npm run test
+
+  # 3. Etapa de Construcción de imágenes Docker
+  build:
+    name: Docker Images Build
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v5
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build Backend Image
+        uses: docker/build-push-action@v7
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          push: false
+          tags: promotions-backend:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build Frontend Image
+        uses: docker/build-push-action@v7
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          push: false
+          tags: promotions-frontend:latest
+          build-args: |
+            VITE_API_URL=http://localhost:3000
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # 4. Etapa de Smoke Test de Integración
+  smoke-test:
+    name: Integration Smoke Test
+    runs-on: ubuntu-latest
+    needs: build
+    env:
+      # Cargar secretos de GitHub Secrets con fallbacks seguros para evitar caídas en el primer despliegue sin configurar
+      POSTGRES_USER: ${{ secrets.POSTGRES_USER || 'postgres' }}
+      POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD || 'postgres_pass' }}
+      POSTGRES_DB: ${{ secrets.POSTGRES_DB || 'promotions_db' }}
+      DATABASE_URL: ${{ secrets.DATABASE_URL || 'postgresql://postgres:postgres_pass@db:5432/promotions_db?schema=public' }}
+      PORT: ${{ secrets.PORT || '3000' }}
+      VITE_API_URL: ${{ secrets.VITE_API_URL || 'http://localhost:3000' }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v5 # <-- Actualizado de v4 a v5
+
+      - name: Validate Environment Variables & Generate .env
+        run: |
+          echo "Validando inyección de variables obligatorias del archivo .env.example..."
+
+          # Verificar la existencia de .env.example
+          if [ ! -f .env.example ]; then
+            echo "::error::Archivo .env.example no encontrado en la raíz del proyecto."
+            exit 1
+          fi
+
+          # Crear archivo .env en blanco
+          > .env
+
+          # Leer .env.example línea por línea y validar
+          while IFS= read -r line || [ -n "$line" ]; do
+            # Limpiar saltos de línea de Windows (\r) si los hay
+            line=$(echo "$line" | tr -d '\r')
+            
+            # Ignorar líneas vacías y comentarios
+            if [[ ! "$line" =~ ^# ]] && [[ "$line" =~ = ]]; then
+              var_name=$(echo "$line" | cut -d'=' -f1 | xargs)
+              
+              # Obtener valor de la variable de entorno cargada en la sesión
+              var_value="${!var_name}"
+              
+              # Fallar si la variable de entorno no está definida en la sesión
+              if [ -z "$var_value" ]; then
+                echo "::error::Falta la variable de entorno obligatoria '$var_name' en la configuración."
+                exit 1
+              fi
+              
+              # Escribir variable validada en el .env real para Docker Compose
+              echo "$var_name=$var_value" >> .env
+            fi
+          done < .env.example
+
+          echo "¡Validación exitosa! Archivo .env generado correctamente."
+
+      - name: Start Services with Docker Compose
+        run: |
+          docker compose up -d --build
+
+      - name: Verify Services Health (Smoke Test)
+        run: |
+          echo "Verificando el estado de la aplicación mediante /health..."
+
+          # Intentar llamar al endpoint de salud en un ciclo de reintentos
+          max_attempts=30
+          attempt=1
+          success=false
+
+          while [ $attempt -le $max_attempts ]; do
+            # Obtener el código de estado HTTP e ignorar el output
+            http_status=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/health || true)
+            
+            if [ "$http_status" = "200" ]; then
+              echo "¡Smoke Test Exitoso! El backend respondió con HTTP 200 OK y la base de datos está en línea."
+              success=true
+              break
+            fi
+            
+            echo "Intento $attempt/$max_attempts: El backend respondió con código ($http_status). Esperando 2 segundos..."
+            sleep 2
+            attempt=$((attempt + 1))
+          done
+
+          if [ "$success" = false ]; then
+            echo "::error::Smoke Test fallido. La aplicación no respondió HTTP 200 en /health tras 60 segundos."
+            echo "=== LOGS DEL CONTENEDOR BACKEND ==="
+            docker compose logs backend || true
+            echo "=== LOGS DEL CONTENEDOR BASE DE DATOS ==="
+            docker compose logs db || true
+            exit 1
+          fi
+
+      - name: Stop Services
+        if: always()
+        run: |
+          docker compose down -v

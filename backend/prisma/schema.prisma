@@ -1,0 +1,42 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum DiscountType {
+  PORCENTAJE
+  MONTO_FIJO
+}
+
+enum PromotionStatus {
+  PROGRAMADA
+  ACTIVA
+  FINALIZADA
+}
+
+model Category {
+  id          Int         @id @default(autoincrement())
+  name        String      @unique
+  description String?
+  promotions  Promotion[]
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime    @updatedAt
+}
+
+model Promotion {
+  id            Int             @id @default(autoincrement())
+  name          String
+  categoryId    Int
+  category      Category        @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  discountType  DiscountType
+  discountValue Float
+  startDate     DateTime
+  endDate       DateTime
+  status        PromotionStatus @default(PROGRAMADA)
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+}
